@@ -2,6 +2,8 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import { createHmac, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
+import { ProviderMetricsService } from '../observability/provider-metrics.service';
 import {
   Suscripcion,
   SuscripcionesService,
@@ -49,11 +51,13 @@ export class WebhooksService {
   constructor(
     private readonly httpService: HttpService,
     private readonly suscripcionesService: SuscripcionesService,
+    private readonly metrics: ProviderMetricsService,
   ) {}
 
   async dispatch(event: string, data: Record<string, unknown>) {
     const subscriptions = this.suscripcionesService.findByEvent(event);
     if (!subscriptions.length) {
+      this.metrics.webhookSkipped();
       this.logger.warn(
         `No hay suscripciones para ${event}; webhook no enviado`,
       );
@@ -85,6 +89,7 @@ export class WebhooksService {
       throw new NotFoundException(`No existe la entrega ${id}`);
     }
     this.logger.log(`Reenviando la entrega ${id} a ${original.url}`);
+    this.metrics.webhookReplay();
     return this.deliver(
       { id: original.subscriptionId, url: original.url, event: original.event },
       original.payload,
@@ -101,6 +106,7 @@ export class WebhooksService {
     signature: string,
     replayOf: string | null,
   ): Promise<WebhookDelivery> {
+    const deliveryStarted = performance.now();
     const headers = {
       'Content-Type': 'application/json',
       'X-Signature': signature,
@@ -113,6 +119,10 @@ export class WebhooksService {
 
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       const startedAt = Date.now();
+      this.metrics.webhookAttempt();
+      if (attempt > 1) {
+        this.metrics.webhookRetry();
+      }
       try {
         const response = await firstValueFrom(
           this.httpService.post(target.url, body, { headers, timeout: 5000 }),
@@ -136,6 +146,7 @@ export class WebhooksService {
           responseStatus: response.status,
           sentAt,
           replayOf,
+          deliveryStarted,
         });
       } catch (error) {
         const response = (
@@ -175,6 +186,7 @@ export class WebhooksService {
       error: lastError,
       sentAt,
       replayOf,
+      deliveryStarted,
     });
   }
 
@@ -189,6 +201,7 @@ export class WebhooksService {
     error?: string;
     sentAt: string;
     replayOf: string | null;
+    deliveryStarted: number;
   }): WebhookDelivery {
     const delivery: WebhookDelivery = {
       id: randomUUID(),
@@ -211,6 +224,11 @@ export class WebhooksService {
     if (this.deliveries.length > MAX_DELIVERIES) {
       this.deliveries.shift();
     }
+    this.metrics.webhookDelivery(delivery.result);
+    this.metrics.recordWebhookDuration(
+      delivery.result,
+      (performance.now() - entry.deliveryStarted) / 1000,
+    );
     return delivery;
   }
 }

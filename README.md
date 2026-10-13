@@ -25,6 +25,11 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Observabilidad de Service B
+
+La configuración de OpenTelemetry, las métricas del proveedor simulado y sus
+pruebas se documentan en [src/observability/README.md](src/observability/README.md).
+
 ## Project setup
 
 ```bash
