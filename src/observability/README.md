@@ -101,6 +101,7 @@ npm run build
 npm test -- --runInBand
 node test/verify-otlp.cjs
 node test/verify-otlp.cjs --business
+node test/verify-otlp.cjs --flow
 npm run test:e2e -- --runInBand
 ```
 
@@ -108,6 +109,14 @@ La prueba OTLP arranca la aplicación compilada con el preload real y verifica
 `GET /` (200), trazas HTTP/NestJS y métricas HTTP. En modo `--business` registra
 eventos sintéticos de los diez contadores y ambos histogramas y comprueba los
 valores recibidos. No representa un pago real ni realiza entregas a merchants.
+
+En modo `--flow` no se llaman directamente los métodos de métricas: se envían
+tres `POST /payments` locales que generan REJECTED, DEFERRED y APPROVED. Primero
+se verifica el caso sin suscripciones; después se registra un receptor local,
+se comprueban la entrega HMAC y su replay por HTTP, y se validan los valores
+exportados. El replay no aumenta los resultados de pagos. Como no hay fallos ni
+reintentos en este escenario, sus dos contadores no generan series: se verifica
+también esa ausencia. Las pruebas unitarias cubren esos caminos de error.
 
 El proceso hijo no lee `.env`, elimina la configuración OTLP heredada y desactiva
 la suscripción por defecto. Exporta solo a `127.0.0.1`, sin credenciales reales.
@@ -121,12 +130,98 @@ Railway ni la recepción en Grafana Cloud**. Solo el preload inicia el SDK.
 - ESLint de archivos TypeScript afectados: sin errores.
 - OTLP local automático y personalizado: correcto; diez contadores monotónicos
   y dos histogramas en segundos recibidos, junto con la instrumentación automática.
+- OTLP del flujo HTTP local (`--flow`): correcto; tres pagos recibidos, dos
+  APPROVED, un REJECTED, un DEFERRED, tres eventos sin suscripciones, dos intentos,
+  dos entregas y un replay. Tres muestras de procesamiento y dos de entrega;
+  firma y cuerpo preservados. Sin incrementos directos desde el test.
 - E2E de Jest: no ejecutó casos por carga ESM de `@nestjs/axios`, problema presente
   antes de las métricas. No se cambiaron dependencias/configuración de Jest para
   ocultarlo. El proceso Node aislado sí comprobó el arranque real.
 - La instalación anterior reportó 26 vulnerabilidades npm (21 moderadas, 3 altas,
   2 críticas). No se ejecutó `npm audit fix --force`; la revisión de dependencias
   queda pendiente y no se atribuyen automáticamente todos los avisos a OTel.
+
+## Diagnóstico de `No data` en producción
+
+### Causa comprobada en Railway
+
+Al revisar el servicio B, el despliegue activo `62ff16ae-203e-4047-a9d8-623fc8da3663`
+estaba en estado SUCCESS, desde **`main`, commit `7c4e05b`** (solo dependencias
+OpenTelemetry). Las métricas de negocio se publicaron en **`development`, commit
+`684e638`**. El árbol de `7c4e05b` no contiene `src/observability/`.
+Esto explica que lleguen métricas automáticas, pero ninguna serie `provider_*`:
+el proceso desplegado no contiene los instrumentos ni sus llamadas.
+Es una observación del despliegue al investigar, no una afirmación sobre futuros despliegues.
+
+No se encontró un defecto de registro o de proveedor en el código de development:
+
+- `metrics.module.ts` registra y exporta `ProviderMetricsService`.
+- `../payments/payments.module.ts` y `../webhooks/webhooks.module.ts` importan
+  `MetricsModule`; `AppModule` carga ambos. Nest comparte el módulo/servicio.
+- `provider-metrics.service.ts` obtiene el meter global con `metrics.getMeter()`;
+  no instala otro proveedor. La dependencia API local está deduplicada.
+- `../payments/payments.service.ts` cuenta después de validar/guardar el pago,
+  registra cada transición de estado y mide el procesamiento en `finally`.
+- `../webhooks/webhooks.service.ts` cuenta por intento real, por entrega final,
+  por replay existente y por despacho sin suscripciones.
+- Los contadores son sumas monotónicas de enteros y los histogramas usan `s`;
+  nombres y atributos son compatibles con OTLP. No requieren renombrado ni
+  un segundo SDK para Grafana.
+
+En Railway se comprobaron, sin imprimir secretos: preload presente,
+`OTEL_SERVICE_NAME=servicio-b`, `OTEL_METRICS_EXPORTER=otlp`, protocolo
+`http/protobuf`, endpoint/cabeceras configurados y sin override de endpoint de
+métricas. `OTEL_LOG_LEVEL=error`; no hay intervalo personalizado ni SDK desactivado.
+La muestra disponible de 33 líneas de logs no mostró errores comunes del
+exportador. Esto no garantiza recepción en Grafana ni descarta otros errores.
+
+### Corrección mínima y verificación
+
+1. **Desplegar código que incluya `684e638`**. Si producción debe seguir `main`,
+   integrar `development` a `main` mediante el flujo habitual de revisión. Si B
+   debe desplegar development, cambiar la rama fuente en Settings del servicio
+   Railway y desplegar esa rama. No hacer ambas cosas sin necesidad. Reiniciar
+   o redeployar el antiguo `7c4e05b` no añade las métricas. Durante esta revisión
+   no se hizo merge, push, cambio de rama fuente ni despliegue.
+2. Confirmar SUCCESS y el SHA efectivo del nuevo despliegue, y que sus logs de
+   arranque incluyan `MetricsModule dependencies initialized` (si Nest mantiene
+   habilitados esos logs). No basta con que el push haya terminado.
+3. Crear pagos FAKE de prueba desde A, para que B use IDs válidos del merchant.
+   Un pago válido debe incrementar `received`; luego `approved` o `rejected`.
+   DEFERRED exige llegar al umbral configurado. Verificar estados y entregas.
+4. Esperar al menos dos ciclos de exportación, normalmente unos 120 segundos,
+   y consultar Explore en una ventana reciente de 15 minutos:
+
+   ```promql
+   {__name__=~".*provider.*"}
+   ```
+
+   Después aplicar el filtro conocido:
+
+   ```promql
+   {service_name="servicio-b", __name__=~".*provider.*"}
+   ```
+
+   Si solo funciona la primera, revisar las etiquetas de recurso realmente
+   promovidas a etiquetas Prometheus. Los instrumentos manuales y automáticos
+   comparten recurso/exportador, no necesitan añadir `service_name` a cada evento.
+
+5. No exigir doce series después de un solo pago exitoso: crear un Counter sin
+   `add()` o un Histogram sin `record()` no genera puntos. Un 400 de validación
+   no aumenta `received`; `failed` requiere agotar tres intentos, `retries` un
+   intento adicional, `replayed` un replay válido y `skipped` ninguna suscripción.
+   El histograma de procesamiento se registra al terminar también las entregas.
+6. Solo si continúa el problema con el SHA correcto y eventos verificados,
+   revisar logs OTLP: errores 401/403 (autorización), 404 (ruta), 429 (límites),
+   timeouts/DNS/TLS, fallos de exportación y respuestas OTLP de éxito parcial.
+   El endpoint genérico usa la URL base OTLP y añade `/v1/metrics`; un endpoint
+   específico de métricas debe tener la ruta final. Revisar overrides de
+   protocolo/cabeceras por señal, scopes de escritura y posibles filtros/views
+   en la canalización. No imprimir cabeceras, tokens ni respuestas privadas.
+   Si hace falta más diagnóstico, activar temporalmente un nivel informativo
+   en un entorno controlado; evitar debug/console en producción sin revisión
+   porque puede revelar payloads. No cambiar credenciales que ya funcionan
+   para las métricas automáticas como primera medida.
 
 ## Generar eventos de demostración
 

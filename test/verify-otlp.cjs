@@ -1,18 +1,36 @@
 // Receptor OTLP aislado: no lee .env ni contacta merchants/Grafana.
 // Primero verifica instrumentación automática; --business añade las métricas de negocio.
+// --flow verifica POST /payments, WebHooks firmados y replay reales, solo en localhost.
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const { createHmac } = require('node:crypto');
 const { createServer } = require('node:http');
 const { resolve } = require('node:path');
 
 async function main() {
   const business = process.argv.includes('--business');
+  const flow = process.argv.includes('--flow');
+  assert.ok(!(business && flow), 'Use --business o --flow, no ambos');
   const requests = [];
+  const webhookBodies = [];
+  const secret = 'local-otel-test-not-a-production-secret';
   const receiver = createServer((req, res) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
       try {
+        if (req.url === '/merchant') {
+          const body = Buffer.concat(chunks).toString('utf8');
+          assert.equal(req.method, 'POST');
+          assert.equal(
+            req.headers['x-signature'],
+            createHmac('sha256', secret).update(body).digest('hex'),
+          );
+          webhookBodies.push(body);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"applied":false}');
+          return;
+        }
         assert.ok(['/v1/traces', '/v1/metrics'].includes(req.url));
         requests.push({
           path: req.url,
@@ -34,7 +52,10 @@ async function main() {
   );
   Object.assign(env, {
     DEFAULT_WEBHOOK_URL: '',
-    HMAC_SECRET: 'local-otel-test-not-a-production-secret',
+    HMAC_SECRET: secret,
+    PROCESSING_DELAY_MS: '10',
+    DEFERRED_THRESHOLD: '100',
+    LOCAL_WEBHOOK_URL: `http://127.0.0.1:${receiver.address().port}/merchant`,
     OTEL_SERVICE_NAME: 'servicio-b-otlp-local-check',
     OTEL_TRACES_EXPORTER: 'otlp',
     OTEL_METRICS_EXPORTER: 'otlp',
@@ -58,6 +79,45 @@ async function main() {
       const response = await fetch('http://127.0.0.1:' + app.getHttpServer().address().port + '/', { signal: AbortSignal.timeout(10000) });
       if (response.status !== 200 || await response.text() !== 'Hello World!') throw new Error('HTTP smoke failed');
       console.log('SMOKE_PHASE:http_checked');
+      if (${flow}) {
+        const assert = require('node:assert/strict');
+        const base = 'http://127.0.0.1:' + app.getHttpServer().address().port;
+        async function request(path, body) {
+          const response = await fetch(base + path, {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body === undefined ? undefined : JSON.stringify(body),
+            signal: AbortSignal.timeout(10000),
+          });
+          assert.ok(response.ok, path + ': HTTP ' + response.status);
+          return response.json();
+        }
+        async function until(check) {
+          const deadline = Date.now() + 10000;
+          while (!(await check())) {
+            assert.ok(Date.now() < deadline, 'Payment flow timed out');
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+        }
+        // No se invoca ProviderMetricsService: todos los eventos salen del flujo de negocio.
+        await request('/payments', { paymentId: 'local-rejected', amount: 3 });
+        await request('/payments', { paymentId: 'local-deferred', amount: 100 });
+        await until(async () => {
+          const payments = await request('/payments');
+          return payments.length === 2 && payments.every(payment => ['APPROVED', 'REJECTED'].includes(payment.status));
+        });
+        const { SuscripcionesService, PAYMENT_UPDATED_EVENT } = require('./dist/suscripciones/suscripciones.service');
+        app.get(SuscripcionesService).create({ url: process.env.LOCAL_WEBHOOK_URL, event: PAYMENT_UPDATED_EVENT });
+        await request('/payments', { paymentId: 'local-delivered', amount: 2 });
+        await until(async () => (await request('/webhooks/entregas')).length === 1);
+        const [original] = await request('/webhooks/entregas');
+        assert.equal(original.result, 'DELIVERED');
+        const replay = await request('/webhooks/entregas/' + original.id + '/reenviar', {});
+        assert.equal(replay.result, 'DELIVERED');
+        assert.equal(replay.replayOf, original.id);
+        assert.equal(replay.request.body, original.request.body);
+        console.log('SMOKE_PHASE:payment_flow_checked');
+      }
       if (${business}) {
         const { ProviderMetricsService } = require('./dist/observability/provider-metrics.service');
         const metrics = app.get(ProviderMetricsService);
@@ -195,6 +255,44 @@ async function main() {
       }
       console.log(
         'BUSINESS OTLP local OK: diez contadores y dos histogramas reutilizando el mismo proveedor.',
+      );
+    }
+    if (flow) {
+      for (const [name, expected] of Object.entries({
+        provider_payments_received: 3,
+        provider_payments_approved: 2,
+        provider_payments_rejected: 1,
+        provider_payments_deferred: 1,
+        provider_webhooks_skipped: 3,
+        provider_webhooks_attempts: 2,
+        provider_webhooks_delivered: 2,
+        provider_webhooks_replayed: 1,
+      })) {
+        const metric = metrics.get(name);
+        assert.ok(metric?.sum?.isMonotonic, `Missing flow counter ${name}`);
+        assert.equal(metric.sum.dataPoints.length, 1);
+        const point = metric.sum.dataPoints[0];
+        assert.equal(Number(point.asInt ?? point.asDouble), expected, name);
+        assert.deepEqual(point.attributes, [
+          { key: 'provider', value: { stringValue: 'FAKE' } },
+        ]);
+      }
+      // Crear instrumentos no exporta series sin eventos: este flujo no falla ni reintenta.
+      assert.ok(!metrics.has('provider_webhooks_failed'));
+      assert.ok(!metrics.has('provider_webhooks_retries'));
+      for (const [name, count] of [
+        ['provider_payment_processing_duration', 3],
+        ['provider_webhook_delivery_duration', 2],
+      ]) {
+        const metric = metrics.get(name);
+        assert.equal(metric?.unit, 's');
+        assert.equal(Number(metric.histogram.dataPoints[0].count), count);
+        assert.ok(metric.histogram.dataPoints[0].sum >= 0);
+      }
+      assert.equal(webhookBodies.length, 2);
+      assert.equal(webhookBodies[0], webhookBodies[1]);
+      console.log(
+        'FLOW OTLP local OK: pagos HTTP, APPROVED/REJECTED/DEFERRED, skipped, entrega HMAC y replay; sin incrementos directos de prueba.',
       );
     }
     console.log(
